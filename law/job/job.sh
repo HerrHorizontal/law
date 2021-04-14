@@ -139,6 +139,7 @@ action() {
             local rest="$( expr 100 - 4 - $length )"
             echo "$( _law_job_line 2 ) $title $( _law_job_line $rest )"
         fi
+        echo
     }
 
     _law_job_subsection() {
@@ -156,10 +157,10 @@ action() {
         fi
 
         # function existing?
-        if type "$name" &> /dev/null; then
+        if command -v "$name" &> /dev/null; then
             eval "$name" "$@"
         else
-            2>&1 echo "function '$name' does not exist"
+            2>&1 echo "function '$name' does not exist, skip"
             return "2"
         fi
     }
@@ -168,125 +169,6 @@ action() {
         _law_job_section "hook $@"
 
         _law_job_call_func "$@"
-        local hook_ret="$?"
-
-        return "$hook_ret"
-    }
-
-    _law_job_setup_dashboard() {
-        _law_job_section "setup dashboard"
-
-        load_dashboard_file() {
-            local dashboard_file="{{dashboard_file}}"
-            if [ ! -z "$dashboard_file" ]; then
-                echo "load dashboard file $dashboard_file"
-                source "$dashboard_file" ""
-            else
-                echo "dashboard file empty, skip"
-            fi
-        }
-
-        load_dashboard_file
-        local dashboard_ret="$?"
-
-        if [ "$dashboard_ret" != "0" ]; then
-            2>&1 echo "dashboard file failed with code $dashboard_ret stop job"
-            _law_job_finalize "10"
-            return "$?"
-        fi
-
-        return "0"
-    }
-
-    _law_job_bootstrap() {
-        _law_job_section "bootstrapping"
-
-        run_bootstrap_file() {
-            local bootstrap_file="{{bootstrap_file}}"
-
-            _law_job_subsection "bootstrap file"
-
-            if [ ! -z "$bootstrap_file" ]; then
-                echo "run bootstrap file '$bootstrap_file'"
-                source "$bootstrap_file" ""
-            else
-                echo "bootstrap file empty, skip"
-            fi
-        }
-
-        run_bootstrap_file
-        local bootstrap_ret="$?"
-
-        if [ "$bootstrap_ret" != "0" ]; then
-            2>&1 echo "bootstrap file failed with code $bootstrap_ret, stop job"
-            _law_job_finalize "20"
-            return "$?"
-        fi
-
-        run_bootstrap_command() {
-            local bootstrap_command="{{bootstrap_command}}"
-
-            _law_job_subsection "bootstrap command"
-
-            if [ ! -z "$bootstrap_command" ]; then
-                echo "run bootstrap command '$bootstrap_command'"
-                bash -c "$bootstrap_command"
-            else
-                echo "bootstrap command empty, skip"
-            fi
-        }
-
-        echo
-        run_bootstrap_command
-        bootstrap_ret="$?"
-
-        if [ "$bootstrap_ret" != "0" ]; then
-            2>&1 echo "bootstrap command failed with code $bootstrap_ret, stop job"
-            _law_job_finalize "30"
-            return "$?"
-        fi
-
-        return "0"
-    }
-
-    _law_job_detect_law() {
-        _law_job_section "detect law"
-
-        export LAW_SRC_PATH="$( law location )"
-
-        if [ -z "$LAW_SRC_PATH" ] || [ ! -d "$LAW_SRC_PATH" ]; then
-            2>&1 echo "law not found (should be made available in bootstrap file), stop job"
-            _law_job_finalize "40"
-            return "$?"
-        fi
-
-        echo "found law at $LAW_SRC_PATH"
-    }
-
-    _law_job_finalize() {
-        local job_exit_code="${1:-0}"
-        local task_exit_code="$2"
-
-        # stageout
-        # when the job exit code was zero, replace it by that of stageout
-        _law_job_stageout "$job_exit_code"
-        local stageout_ret="$?"
-        if [ "$job_exit_code" = "0" ]; then
-            job_exit_code="$stageout_ret"
-        fi
-
-        # cleanup
-        _law_job_cleanup
-
-        # some final logs
-        _law_job_section "end"
-        echo "start time    : $_law_job_start_time"
-        echo "end time      : $( date +"%d/%m/%Y %T.%N (%Z)" )"
-        [ ! -z "$task_exit_code" ] && echo "task exit code: $task_exit_code"
-        echo "job exit code : $job_exit_code"
-        echo
-
-        return "$job_exit_code"
     }
 
     _law_job_stageout() {
@@ -346,7 +228,7 @@ action() {
         cd "$LAW_JOB_INIT_DIR"
 
         _law_job_subsection "files before cleanup"
-        echo "directory: $LAW_JOB_HOME"
+        echo "> ls -a $LAW_JOB_HOME (\$LAW_JOB_HOME)"
         ls -la "$LAW_JOB_HOME"
 
         # actual cleanup
@@ -354,8 +236,132 @@ action() {
 
         echo
         _law_job_subsection "files after cleanup"
-        echo "directory: $LAW_JOB_INIT_DIR"
+        echo "> ls -a $LAW_JOB_INIT_DIR (\$LAW_JOB_INIT_DIR)"
         ls -la "$LAW_JOB_INIT_DIR"
+    }
+
+    _law_job_finalize() {
+        local job_exit_code="${1:-0}"
+        local task_exit_code="$2"
+
+        # stageout
+        # when the job exit code was zero, replace it by that of stageout
+        _law_job_stageout "$job_exit_code"
+        local stageout_ret="$?"
+        [ "$job_exit_code" = "0" ] && job_exit_code="$stageout_ret"
+
+        # cleanup
+        _law_job_cleanup
+
+        # some final logs
+        _law_job_section "end"
+        echo "start time    : $_law_job_start_time"
+        echo "end time      : $( date +"%d/%m/%Y %T.%N (%Z)" )"
+        [ ! -z "$task_exit_code" ] && echo "task exit code: $task_exit_code"
+        echo "job exit code : $job_exit_code"
+        echo
+
+        return "$job_exit_code"
+    }
+
+    _law_job_bootstrap() {
+        run_bootstrap_file() {
+            local bootstrap_file="{{bootstrap_file}}"
+
+            _law_job_subsection "bootstrap file"
+
+            if [ ! -z "$bootstrap_file" ]; then
+                echo "run bootstrap file '$bootstrap_file'"
+                source "$bootstrap_file" ""
+            else
+                echo "bootstrap file empty, skip"
+            fi
+        }
+
+        run_bootstrap_file
+        local bootstrap_ret="$?"
+
+        if [ "$bootstrap_ret" != "0" ]; then
+            2>&1 echo "bootstrap file failed with code $bootstrap_ret, stop job"
+            _law_job_finalize "20"
+            return "$?"
+        fi
+
+        run_bootstrap_command() {
+            local bootstrap_command="{{bootstrap_command}}"
+
+            _law_job_subsection "bootstrap command"
+
+            if [ ! -z "$bootstrap_command" ]; then
+                echo "run bootstrap command '$bootstrap_command'"
+                bash -c "$bootstrap_command"
+            else
+                echo "bootstrap command empty, skip"
+            fi
+        }
+
+        echo
+        run_bootstrap_command
+        bootstrap_ret="$?"
+
+        if [ "$bootstrap_ret" != "0" ]; then
+            2>&1 echo "bootstrap command failed with code $bootstrap_ret, stop job"
+            _law_job_finalize "30"
+            return "$?"
+        fi
+
+        return "0"
+    }
+
+    _law_job_detect_law() {
+        _law_job_subsection "detect law"
+
+        export LAW_SRC_PATH="$( law location )"
+        local law_ret="$?"
+
+        if [ "$law_ret" != "0" ] || [ -z "$LAW_SRC_PATH" ] || [ ! -d "$LAW_SRC_PATH" ]; then
+            2>&1 echo "law not found with code $law_ret, should be made available in bootstrap file, stop job"
+            _law_job_finalize "40"
+            return "$?"
+        fi
+
+        echo "found law at $LAW_SRC_PATH"
+    }
+
+    _law_job_setup_dashboard() {
+        _law_job_subsection "setup dashboard"
+
+        load_dashboard_file() {
+            local dashboard_file="{{dashboard_file}}"
+            if [ ! -z "$dashboard_file" ]; then
+                echo "load dashboard file $dashboard_file"
+                source "$dashboard_file" ""
+            else
+                echo "dashboard file empty, skip"
+            fi
+        }
+
+        load_dashboard_file
+        local dashboard_ret="$?"
+
+        if [ "$dashboard_ret" != "0" ]; then
+            2>&1 echo "dashboard file failed with code $dashboard_ret stop job"
+            _law_job_finalize "10"
+            return "$?"
+        fi
+
+        return "0"
+    }
+
+    _law_job_print_vars() {
+        _law_job_subsection "environment variables"
+
+        echo "PATH           : $PATH"
+        echo "PYTHONPATH     : $PYTHONPATH"
+        echo "PYTHON27PATH   : $PYTHON27PATH"
+        echo "PYTHON3PATH    : $PYTHON3PATH"
+        echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+        echo "CPATH          : $CPATH"
     }
 
 
@@ -365,13 +371,12 @@ action() {
 
     _law_job_section "environment"
 
-    if type hostnamectl &> /dev/null; then
-        echo
-        _law_job_subsection "host infos:"
+    if command -v hostnamectl &> /dev/null; then
+        _law_job_subsection "host infos"
         hostnamectl status
+        echo
     fi
 
-    echo
     _law_job_subsection "job infos"
     echo "shell    : $SHELL"
     echo "hostname : $( hostname )"
@@ -394,8 +399,10 @@ action() {
     echo "dashboard data: $LAW_JOB_DASHBOARD_DATA"
 
     echo
-    _law_job_subsection "file infos:"
-    echo "ls -la"
+    _law_job_subsection "file infos"
+    echo "> pwd"
+    pwd
+    echo "> ls -la"
     ls -la
 
 
@@ -403,12 +410,18 @@ action() {
     # setup
     #
 
+    _law_job_section "setup"
+
+    _law_job_bootstrap || return "$?"
+    echo
+    _law_job_detect_law || return "$?"
+    echo
+    _law_job_setup_dashboard || return "$?"
+    echo
+    _law_job_print_vars || return "$?"
+
     # mark the job as running
     _law_job_call_hook law_hook_job_running
-
-    _law_job_setup_dashboard || return "$?"
-    _law_job_bootstrap || return "$?"
-    _law_job_detect_law || return "$?"
 
 
     #

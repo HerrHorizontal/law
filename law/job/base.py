@@ -4,7 +4,6 @@
 Base classes for implementing remote job management and job file creation.
 """
 
-
 __all__ = ["BaseJobManager", "BaseJobFileFactory", "JobArguments"]
 
 
@@ -38,8 +37,7 @@ def get_async_result_silent(result, timeout=None):
         return e
 
 
-@six.add_metaclass(ABCMeta)
-class BaseJobManager(object):
+class BaseJobManager(six.with_metaclass(ABCMeta, object)):
     """
     Base class that defines how remote jobs are submitted, queried, cancelled and cleaned up. It
     also defines the most common job states:
@@ -500,8 +498,7 @@ class BaseJobManager(object):
         return line
 
 
-@six.add_metaclass(ABCMeta)
-class BaseJobFileFactory(object):
+class BaseJobFileFactory(six.with_metaclass(ABCMeta, object)):
     """
     Base class that handles the creation of job files. It is likely that inheriting classes only
     need to implement the :py:meth:`create` method as well as extend the constructor to handle

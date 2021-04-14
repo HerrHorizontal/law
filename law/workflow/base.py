@@ -4,7 +4,6 @@
 Workflow and workflow proxy base class definitions.
 """
 
-
 __all__ = ["BaseWorkflow", "workflow_property", "cached_workflow_property"]
 
 
@@ -21,7 +20,7 @@ import six
 from law.task.base import Task, Register
 from law.task.proxy import ProxyTask, get_proxy_attribute
 from law.target.collection import TargetCollection
-from law.parameter import NO_STR, NO_INT, CSVParameter
+from law.parameter import NO_STR, NO_INT, MultiRangeParameter
 from law.util import (
     no_value, make_list, iter_chunks, range_expand, range_join, create_hash, DotDict,
 )
@@ -111,14 +110,6 @@ class BaseWorkflowProxy(ProxyTask):
         Returns the default workflow outputs in an ordered dictionary. At the moment this is just
         the collection of outputs of the branch tasks, stored with the key ``"collection"``.
         """
-        # warn about the deprecation of the legacy "outputs_siblings" and
-        # "target_collection_cls" flag (until v0.1)
-        attrs = ("outputs_siblings", "target_collection_cls")
-        if any(getattr(self.task, attr, None) for attr in attrs):
-            attrs = ", ".join(attrs[:-1]) + " and " + attrs[-1]
-            logger.warning("the attributes {} to define the class of the workflow output target "
-                "collection are deprecated, please use output_collection_cls instead".format(attrs))
-
         cls = self.task.output_collection_cls or TargetCollection
         targets = luigi.task.getpaths(self.task.get_branch_tasks())
         collection = cls(targets, threshold=self.threshold(len(targets)))
@@ -135,7 +126,7 @@ class BaseWorkflowProxy(ProxyTask):
         branch map. For performance purposes, you can set this value, *n*, directly.
         """
         if n is None:
-            n = len(self.task.branch_map())
+            n = len(self.task.get_branch_map())
 
         acceptance = self.task.acceptance
         return (acceptance * n) if acceptance <= 1 else acceptance
@@ -152,6 +143,7 @@ class BaseWorkflowProxy(ProxyTask):
             self.task._branch_tasks = None
             self.task.start_branch = self.task._initial_start_branch
             self.task.end_branch = self.task._initial_end_branch
+            self.task.branches = self.task._initial_branches
 
 
 def workflow_property(func):
@@ -238,22 +230,8 @@ class WorkflowRegister(Register):
         # this flag will define the classes in the mro to consider for instantiating the proxy
         cls._defined_workflow_proxy = "workflow_proxy_cls" in classdict
 
-    def __call__(cls, *args, **kwargs):
-        # complain when an abstract workflow method is not implemented
-        missing_methods = []
-        for attr in getattr(cls, "abstract_workflow_methods", set()):
-            full_attr = "{}_{}".format(cls.workflow_proxy_cls.workflow_type, attr)
-            if getattr(cls, full_attr, no_value) is no_value:
-                missing_methods.append(full_attr)
-        if missing_methods:
-            raise TypeError("cannot create instance of workflow task class '{}' with missing "
-                "method(s) {}".format(cls.__name__, ", ".join(missing_methods)))
 
-        return super(WorkflowRegister, cls).__call__(*args, **kwargs)
-
-
-@six.add_metaclass(WorkflowRegister)
-class BaseWorkflow(Task):
+class BaseWorkflow(six.with_metaclass(WorkflowRegister, Task)):
     """
     Base class of all workflows.
 
@@ -292,7 +270,7 @@ class BaseWorkflow(Task):
        First branch that is *not* processed (pythonic). Defaults to *-1*.
 
     .. py:classattribute:: branches
-       type: law.CSVParameter
+       type: law.MultiRangeParameter
 
        Explicit list of branches to process. Empty default value.
 
@@ -305,13 +283,6 @@ class BaseWorkflow(Task):
        type: None, callable
 
        Custom completion check that is used by the workflow's proxy when callable.
-
-    .. py:classattribute:: abstract_workflow_methods
-       type: set
-
-       Names of methods that have to be implemented by inheriting workflow classes, as checked by
-       the :py:class:`WorkflowRegister` meta class. The names of methods to implement must start
-       with the workflow type followed by an underscore.
 
     .. py:classattribute:: output_collection_cls
        type: TargetCollection
@@ -389,8 +360,10 @@ class BaseWorkflow(Task):
         "value means first; default: empty")
     end_branch = luigi.IntParameter(default=NO_INT, description="the branch to end at; empty value "
         "means last; default: empty")
-    branches = CSVParameter(default=(), unique=True, description="list of branches to select; "
-        "has precedence over startBranch and endBranch when set; default: empty")
+    branches = MultiRangeParameter(default=(), require_start=False, require_end=False,
+        single_value=True, description="comma-separated list of branches to select; each value can "
+        "have the format 'start:stop' (inclusive) to support range syntax; has precedence over "
+        "--startBranch and --endBranch when set; default: empty")
 
     # configuration members
     workflow_proxy_cls = BaseWorkflowProxy
@@ -399,7 +372,6 @@ class BaseWorkflow(Task):
     reset_branch_map_before_run = False
     workflow_run_decorators = None
     workflow_complete = None
-    abstract_workflow_methods = set()
 
     # accessible properties
     workflow_property = None
@@ -414,6 +386,19 @@ class BaseWorkflow(Task):
 
     def __init__(self, *args, **kwargs):
         super(BaseWorkflow, self).__init__(*args, **kwargs)
+
+        # cached attributes for the workflow
+        self._branch_map = None
+        self._branch_tasks = None
+        self._cache_branches = True
+
+        # cached attributes for branches
+        self._workflow_task = None
+
+        # store original branch boundaries
+        self._initial_start_branch = self.start_branch
+        self._initial_end_branch = self.end_branch
+        self._initial_branches = tuple(self.branches)
 
         # determine workflow proxy class to instantiate
         if self.is_workflow():
@@ -433,17 +418,6 @@ class BaseWorkflow(Task):
             else:
                 raise ValueError("unknown workflow type {}".format(self.workflow))
 
-        # cached attributes for the workflow
-        self._branch_map = None
-        self._branch_tasks = None
-
-        # cached attributes for branches
-        self._workflow_task = None
-
-        # store original branch boundaries
-        self._initial_start_branch = self.start_branch
-        self._initial_end_branch = self.end_branch
-
     def __getattribute__(self, attr, proxy=True):
         return get_proxy_attribute(self, attr, proxy=proxy, super_cls=Task)
 
@@ -460,19 +434,16 @@ class BaseWorkflow(Task):
     def _repr_params(self, *args, **kwargs):
         params = super(BaseWorkflow, self)._repr_params(*args, **kwargs)
 
-        # when this is a workflow, add the workflow type
-        if self.is_workflow() and "workflow" not in params:
-            params["workflow"] = self.workflow
+        if self.is_workflow():
+            # when this is a workflow, add the workflow type
+            if "workflow" not in params:
+                params["workflow"] = self.workflow
+        else:
+            # when this is a branch, remove workflow parameters
+            for param in self.exclude_params_branch:
+                params.pop(param, None)
 
         return params
-
-    @classmethod
-    def _repr_param(cls, name, value, **kwargs):
-        if name == "branches":
-            value = range_join(value, to_str=True)
-            kwargs["serialize"] = False
-
-        return super(BaseWorkflow, cls)._repr_param(name, value, **kwargs)
 
     def is_branch(self):
         """
@@ -486,15 +457,25 @@ class BaseWorkflow(Task):
         """
         return not self.is_branch()
 
-    def as_branch(self, branch=0):
+    def as_branch(self, branch=None):
         """
-        When this task refers to the workflow, a re-instantiated task with a certain *branch* and
-        identical parameters is returned. Otherwise, the branch task itself is returned.
+        When this task refers to the workflow, a re-instantiated task with identical parameters and
+        a certain *branch* value, defaulting to 0, is returned. When this task is already a branch
+        task, the task itself is returned when *branch* is *None* or matches this task's branch
+        value. Otherwise, a new branch task with that value and identical parameters is created and
+        returned.
         """
+        if branch == -1:
+            raise ValueError("branch must not be -1 when selecting a branch task")
+
         if self.is_branch():
-            return self
-        else:
-            return self.req(self, branch=branch, _exclude=self.exclude_params_branch)
+            if branch is None or branch == self.branch:
+                return self
+            else:
+                return self.req(self, branch=branch, _skip_task_excludes=True)
+
+        return self.req(self, branch=branch or 0, _exclude=self.exclude_params_branch,
+            _skip_task_excludes=True)
 
     def as_workflow(self):
         """
@@ -503,17 +484,12 @@ class BaseWorkflow(Task):
         """
         if self.is_workflow():
             return self
-        else:
-            if self._workflow_task is None:
-                self._workflow_task = self.req(self, branch=-1,
-                    _exclude=self.exclude_params_workflow)
-            return self._workflow_task
 
-    def inst_exclude_params_repr(self):
-        params = super(BaseWorkflow, self).inst_exclude_params_repr()
-        if self.is_branch():
-            params.update(self.exclude_params_branch)
-        return params
+        if self._workflow_task is None:
+            self._workflow_task = self.req(self, branch=-1, _exclude=self.exclude_params_workflow,
+                _skip_task_excludes=True)
+
+        return self._workflow_task
 
     @abstractmethod
     def create_branch_map(self):
@@ -522,80 +498,88 @@ class BaseWorkflow(Task):
         """
         return
 
-    def _reset_branch_boundaries(self, branches=None):
+    def _reset_branch_boundaries(self, branch_map):
         if self.is_branch():
             raise Exception("calls to _reset_branch_boundaries are forbidden for branch tasks")
 
-        if branches is None:
-            branches = list(self._branch_map.keys())
+        # get minimum and maximum branches
+        min_branch = min(branch_map.keys())
+        max_branch = max(branch_map.keys())
 
-        min_branch = min(branches)
-        max_branch = max(branches)
+        # reset start_branch, starting from the initial value
+        self.start_branch = max(min_branch, min(max_branch, self._initial_start_branch))
 
-        # reset start_branch
-        self.start_branch = max(min_branch, min(max_branch, self.start_branch))
-
-        # reset end_branch
-        if self.end_branch < 0:
-            self.end_branch = sys.maxsize
+        # reset end_branch, starting from the initial value
+        self.end_branch = sys.maxsize if self._initial_end_branch < 0 else self._initial_end_branch
         self.end_branch = max(self.start_branch, min(max_branch + 1, self.end_branch))
 
-    def _reduce_branch_map(self):
+    def _reduce_branch_map(self, branch_map):
         if self.is_branch():
             raise Exception("calls to _reduce_branch_map are forbidden for branch tasks")
 
-        # when given, reduce by branches, otherwise by start/end branch
+        # when given, reduce by branches, otherwise by start/end branch when already reset
         if self.branches:
             # create a set of branches to remove
-            remove_branches = set(self._branch_map.keys())
-            remove_branches -= set(range_expand(self.branches, min_value=min(remove_branches),
-                max_value=max(remove_branches)))
+            remove_branches = set(branch_map.keys())
+            requested_branches = range_expand(self.branches, min_value=min(remove_branches),
+                max_value=max(remove_branches))
+            remove_branches -= set(requested_branches)
 
             # actual removal
             for b in remove_branches:
-                del self._branch_map[b]
-        else:
-            for b in list(self._branch_map.keys()):
-                if not (self.start_branch <= b < self.end_branch):
-                    del self._branch_map[b]
+                del branch_map[b]
 
-    def get_branch_map(self, reset_boundaries=True, reduce=True):
+        elif 0 <= self.start_branch <= self.end_branch:
+            for b in list(branch_map.keys()):
+                if not (self.start_branch <= b < self.end_branch):
+                    del branch_map[b]
+
+    def get_branch_map(self, reset_boundaries=True, reduce_branches=True):
         """
         Creates and returns the branch map defined in :py:meth:`create_branch_map`. If
         *reset_boundaries* is *True*, the *start_branch* and *end_branch* attributes are rearranged
-        to not exceed the actual branch map length. If *reduce* is *True* and an explicit list of
-        branch numbers was set, the branch map is filtered accordingly. The branch map is cached.
+        to not exceed the actual branch map length. If *reduce_branches* is *True* and an explicit
+        list of branch numbers was set, the branch map is filtered accordingly. The branch map is
+        cached.
         """
         if self.is_branch():
             return self.as_workflow().get_branch_map(reset_boundaries=reset_boundaries,
-                reduce=reduce)
-        else:
-            if self._branch_map is None:
-                self._branch_map = self.create_branch_map()
+                reduce_branches=reduce_branches)
 
-                # some type and sanity checks
-                if isinstance(self._branch_map, (list, tuple)):
-                    self._branch_map = dict(enumerate(self._branch_map))
-                elif isinstance(self._branch_map, six.integer_types):
-                    self._branch_map = dict(enumerate(range(self._branch_map)))
-                elif self.force_contiguous_branches:
-                    n = len(self._branch_map)
-                    if set(self._branch_map.keys()) != set(range(n)):
-                        raise ValueError("branch map keys must constitute contiguous range "
-                            "[0, {})".format(n))
-                else:
-                    for branch in self._branch_map:
-                        if not isinstance(branch, six.integer_types) or branch < 0:
-                            raise ValueError("branch map keys must be non-negative integers, got "
-                                "'{}' ({})".format(branch, type(branch).__name__))
+        if self._branch_map is None:
+            # create a new branch map
+            branch_map = self.create_branch_map()
 
-                # post-process
-                if reset_boundaries:
-                    self._reset_branch_boundaries()
-                if reduce:
-                    self._reduce_branch_map()
+            # some type and sanity checks
+            if isinstance(branch_map, (list, tuple)):
+                branch_map = dict(enumerate(branch_map))
+            elif isinstance(branch_map, six.integer_types):
+                branch_map = dict(enumerate(range(branch_map)))
+            elif self.force_contiguous_branches:
+                n = len(branch_map)
+                if set(branch_map.keys()) != set(range(n)):
+                    raise ValueError("branch map keys must constitute contiguous range "
+                        "[0, {})".format(n))
+            else:
+                for branch in branch_map:
+                    if not isinstance(branch, six.integer_types) or branch < 0:
+                        raise ValueError("branch map keys must be non-negative integers, got "
+                            "'{}' ({})".format(branch, type(branch).__name__))
 
-            return self._branch_map
+            # post-process
+            if reset_boundaries:
+                self._reset_branch_boundaries(branch_map)
+            if reduce_branches:
+                self._reduce_branch_map(branch_map)
+
+            # return the map when we are not going to cache it
+            if not self._cache_branches:
+                return branch_map
+
+            # cache it
+            self._branch_map = branch_map
+
+        return self._branch_map
 
     @property
     def branch_map(self):
@@ -605,10 +589,12 @@ class BaseWorkflow(Task):
     def branch_data(self):
         if self.is_workflow():
             raise Exception("calls to branch_data are forbidden for workflow tasks")
-        elif self.branch not in self.branch_map:
+
+        branch_map = self.get_branch_map()
+        if self.branch not in branch_map:
             raise ValueError("invalid branch '{}', not found in branch map".format(self.branch))
 
-        return self.branch_map[self.branch]
+        return branch_map[self.branch]
 
     def get_branch_tasks(self):
         """
@@ -619,14 +605,17 @@ class BaseWorkflow(Task):
             return self.as_workflow().get_branch_tasks()
 
         if self._branch_tasks is None:
-            branch_map = self.get_branch_map()
-            if branch_map is None:
-                raise AttributeError("workflow task '{}' requires a branch_map".format(self))
+            # get all branch tasks according to the map
+            branch_tasks = OrderedDict()
+            for b in self.get_branch_map():
+                branch_tasks[b] = self.as_branch(branch=b)
 
-            self._branch_tasks = OrderedDict()
-            for b in branch_map:
-                self._branch_tasks[b] = self.req(self, branch=b,
-                    _exclude=self.exclude_params_branch)
+            # return the task when we are not going to cache it
+            if not self._cache_branches:
+                return branch_tasks
+
+            # cache it
+            self._branch_tasks = branch_tasks
 
         return self._branch_tasks
 
@@ -649,7 +638,7 @@ class BaseWorkflow(Task):
             return self.as_workflow().get_branch_chunks(chunk_size)
 
         # get the branch map and create chunks of its branch values
-        branch_chunks = iter_chunks(self.branch_map.keys(), chunk_size)
+        branch_chunks = iter_chunks(self.get_branch_map().keys(), chunk_size)
 
         return list(branch_chunks)
 
@@ -675,9 +664,10 @@ class BaseWorkflow(Task):
             return self.as_workflow().get_all_branch_chunks(chunk_size, **kwargs)
 
         # create a new instance
-        _exclude = make_list(kwargs.get("_exclude", []))
-        _exclude.extend(["start_branch", "end_branch", "branches"])
+        _exclude = set(kwargs.get("_exclude", set()))
+        _exclude |= {"start_branch", "end_branch", "branches"}
         kwargs["_exclude"] = _exclude
+        kwargs["_skip_task_excludes"] = True
         inst = self.req(self, **kwargs)
 
         # return its branch chunks
@@ -690,9 +680,9 @@ class BaseWorkflow(Task):
         via the *branches* parameter, and there are more than *max_ranges* identified ranges, the
         string will contain a unique hash describing those ranges.
         """
-        self.get_branch_map()
+        branch_map = self.get_branch_map()
         if self.branches:
-            ranges = range_join(self.branches)
+            ranges = range_join(list(branch_map.keys()))
             if len(ranges) > max_ranges:
                 return "{}_ranges_{}".format(len(ranges), create_hash(ranges))
             else:

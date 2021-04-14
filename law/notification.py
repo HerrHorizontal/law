@@ -4,14 +4,13 @@
 Notification functions.
 """
 
-
 __all__ = ["notify_mail"]
 
 
 import logging
 
 from law.config import Config
-from law.util import send_mail
+from law.util import send_mail, uncolored
 
 
 logger = logging.getLogger(__name__)
@@ -45,4 +44,4 @@ def notify_mail(title, message, recipient=None, sender=None, smtp_host=None, smt
     if smtp_port:
         mail_kwargs["smtp_port"] = smtp_port
 
-    return send_mail(recipient, sender, title, message, **mail_kwargs)
+    return send_mail(recipient, sender, title, uncolored(message), **mail_kwargs)

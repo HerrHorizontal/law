@@ -4,7 +4,6 @@
 Formatter classes for file targets.
 """
 
-
 __all__ = ["AUTO_FORMATTER", "Formatter", "get_formatter", "find_formatters", "find_formatter"]
 
 
@@ -85,8 +84,7 @@ def find_formatter(path, mode, name=AUTO_FORMATTER):
         return get_formatter(name, silent=False)
 
 
-@six.add_metaclass(FormatterRegister)
-class Formatter(object):
+class Formatter(six.with_metaclass(FormatterRegister, object)):
 
     name = "_base"
 

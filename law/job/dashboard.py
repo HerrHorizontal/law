@@ -4,7 +4,6 @@
 Definition of the job dashboard interface.
 """
 
-
 __all__ = ["BaseJobDashboard", "NoJobDashboard", "cache_by_status"]
 
 
@@ -39,8 +38,7 @@ def cache_by_status(func):
     return wrapper
 
 
-@six.add_metaclass(ABCMeta)
-class BaseJobDashboard(object):
+class BaseJobDashboard(six.with_metaclass(ABCMeta, object)):
     """
     Base class of a minimal job dashboard interface that is used from within
     :py:class:`law.workflow.remote.BaseRemoteWorkflow`'s.

@@ -4,7 +4,6 @@
 Custom luigi base task definitions.
 """
 
-
 __all__ = ["Task", "WrapperTask", "ExternalTask"]
 
 
@@ -74,8 +73,7 @@ class BaseRegister(luigi.task_register.Register):
         return cls
 
 
-@six.add_metaclass(BaseRegister)
-class BaseTask(luigi.Task):
+class BaseTask(six.with_metaclass(BaseRegister, luigi.Task)):
 
     exclude_index = True
     exclude_params_index = set()
@@ -142,7 +140,8 @@ class BaseTask(luigi.Task):
         return cls(**cls.req_params(*args, **kwargs))
 
     @classmethod
-    def req_params(cls, inst, _exclude=None, _prefer_cli=None, **kwargs):
+    def req_params(cls, inst, _exclude=None, _prefer_cli=None, _skip_task_excludes=False,
+            _skip_task_excludes_get=None, _skip_task_excludes_set=None, **kwargs):
         # common/intersection params
         params = common_task_params(inst, cls)
 
@@ -151,8 +150,16 @@ class BaseTask(luigi.Task):
 
         # also use this class' req and req_get sets
         # and the req and req_set sets of the instance's class
-        _exclude.update(cls.exclude_params_req, cls.exclude_params_req_get)
-        _exclude.update(inst.exclude_params_req, inst.exclude_params_req_set)
+        # unless explicitly skipped
+        if _skip_task_excludes_get is None:
+            _skip_task_excludes_get = _skip_task_excludes
+        if not _skip_task_excludes_get:
+            _exclude.update(cls.exclude_params_req, cls.exclude_params_req_get)
+
+        if _skip_task_excludes_set is None:
+            _skip_task_excludes_set = _skip_task_excludes
+        if not _skip_task_excludes_set:
+            _exclude.update(inst.exclude_params_req, inst.exclude_params_req_set)
 
         # remove excluded parameters
         for name in list(params.keys()):
@@ -278,12 +285,12 @@ class Register(BaseRegister):
                 # abort the process if not explicitly skipped
                 if not skip_abort:
                     abort(exitcode=0)
+                print("")
 
         return inst
 
 
-@six.add_metaclass(Register)
-class Task(BaseTask):
+class Task(six.with_metaclass(Register, BaseTask)):
 
     log_file = luigi.Parameter(default=NO_STR, significant=False, description="a custom log file; "
         "default: <task.default_log_file>")
@@ -296,25 +303,30 @@ class Task(BaseTask):
         "collections (default: 0), 3. a flag that is passed to the status text creation (default: "
         "'')")
     print_output = CSVParameter(default=(), significant=False, description="print a flat list of "
-        "output targets but do not run any task; this CSV parameter accepts a single integer value "
-        "which sets the task recursion depth (0 means non-recursive)")
+        "output targets but do not run any task; this CSV parameter accepts up to two values: 1. "
+        "the task recursion depth (0 means non-recursive), 2. a boolean flag that decides whether "
+        "paths of file targets should contain file system schemes (default: False)")
     remove_output = CSVParameter(default=(), significant=False, description="remove task outputs "
-        "but do not run any task; this CSV parameter accepts up to three values: 1. the task "
-        "recursion depth (0 means non-recursive), 2. one of the modes 'i' (interactive), 'a' "
-        "(all), 'd' (dry run) (default: 'i'), 3. a flag that decides whether outputs of external "
-        "tasks should be removed (default: False)")
+        "but do not run any task by default; this CSV parameter accepts up to three values: 1. the "
+        "task recursion depth (0 means non-recursive), 2. one of the modes 'i' (interactive), 'a' "
+        "(all), 'd' (dry run) (default: 'i'), 3. a boolean flag that decides whether the task is "
+        "run after outputs were removed (default: False)")
     fetch_output = CSVParameter(default=(), significant=False, description="copy all task outputs "
         "into a local directory but do not run any task; this CSV parameter accepts up to four "
         "values: 1. the task recursion depth (0 means non-recursive), 2. one of the modes 'i' "
         "(interactive), 'a' (all), 'd' (dry run) (default: 'i'), 3. the target directory (default: "
-        "'.'), 4. a flag that decides whether outputs of external tasks should be fetched "
-        "(default: False)")
+        "'.'), 4. a boolean flag that decides whether external outputs and outputs of external "
+        "tasks should be fetched (default: False)")
 
     interactive_params = [
         "print_deps", "print_status", "print_output", "remove_output", "fetch_output",
     ]
 
+    # cache size for published messages
     message_cache_size = 10
+
+    # force skipping this task when remove_output is set to "all" mode
+    skip_output_removal = False
 
     exclude_index = True
     exclude_params_req = set()
@@ -423,12 +435,16 @@ class Task(BaseTask):
         return super(Task, self).cli_args(exclude=exclude, replace=replace)
 
     def __repr__(self):
-        return self.repr(color=False)
+        color = Config.instance().get_expanded_boolean("task", "colored_repr")
+        return self.repr(color=color)
+
+    def __str__(self):
+        color = Config.instance().get_expanded_boolean("task", "colored_str")
+        return self.repr(color=color)
 
     def repr(self, all_params=False, color=None, **kwargs):
         if color is None:
-            cfg = Config.instance()
-            color = cfg.get_expanded_boolean("task", "colored_repr")
+            color = Config.instance().get_expanded_boolean("task", "colored_repr")
 
         family = self._repr_family(self.get_task_family(), color=color, **kwargs)
 
@@ -442,19 +458,11 @@ class Task(BaseTask):
 
         return "{}({})".format(family, ", ".join(parts))
 
-    def colored_repr(self, all_params=False):
-        # deprecation warning until v0.1
-        logger.warning("the use of {0}.colored_repr() is deprecated, please use "
-            "{0}.repr(color=True) instead".format(self.__class__.__name__))
-
-        return self.repr(all_params=all_params, color=True)
-
     def _repr_params(self, all_params=False):
         # determine parameters to exclude
         exclude = set()
         if not all_params:
             exclude |= self.exclude_params_repr
-            exclude |= self.inst_exclude_params_repr()
             exclude |= set(self.interactive_params)
 
         # build a map "name -> value" for all significant parameters
@@ -468,25 +476,19 @@ class Task(BaseTask):
     def _repr_flags(self):
         return []
 
-    def inst_exclude_params_repr(self):
-        return set()
-
-    @classmethod
-    def _repr_family(cls, family, color=False, **kwargs):
+    def _repr_family(self, family, color=False, **kwargs):
         return colored(family, "green") if color else family
 
-    @classmethod
-    def _repr_param(cls, name, value, color=False, serialize=True, **kwargs):
+    def _repr_param(self, name, value, color=False, serialize=True, **kwargs):
         # try to serialize first unless explicitly disabled
         if serialize:
-            param = getattr(cls, name, no_value)
+            param = getattr(self.__class__, name, no_value)
             if param != no_value:
                 value = param.serialize(value)
 
         return "{}={}".format(colored(name, color="blue", style="bright") if color else name, value)
 
-    @classmethod
-    def _repr_flag(cls, name, color=False, **kwargs):
+    def _repr_flag(self, name, color=False, **kwargs):
         return colored(name, color="magenta") if color else name
 
     def _print_deps(self, args):

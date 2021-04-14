@@ -4,7 +4,6 @@
 Slack notifications.
 """
 
-
 __all__ = ["notify_slack"]
 
 
@@ -14,6 +13,7 @@ import logging
 import six
 
 from law.config import Config
+from law.util import escape_markdown
 
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def notify_slack(title, content, attachment_color="#4bb543", short_threshold=40,
     if mention_user is None:
         mention_user = cfg.get_expanded("notifications", "slack_mention_user")
     if mention_user:
-        mention_text = " (@{})".format(mention_user)
+        mention_text = " (@{})".format(escape_markdown(mention_user))
 
     # request data for the API call
     request = {

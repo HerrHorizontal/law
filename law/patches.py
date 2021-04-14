@@ -5,10 +5,10 @@ Collection of minor patches for luigi. These patches are only intended to suppor
 law, rather than changing default luigi behavior.
 """
 
-
 __all__ = ["before_run", "patch_all"]
 
 
+import re
 import functools
 import logging
 
@@ -276,8 +276,61 @@ def patch_interface_logging():
     """
     Patches ``luigi.setup_logging.InterfaceLogging._default`` to avoid adding multiple tty stream
     handlers to the logger named "luigi-interface" and to preserve any previously set log level.
+    Also, the formatters of its stream handlers are amended in order to colorize parts of luigi log
+    messages.
     """
     _default_orig = luigi.setup_logging.InterfaceLogging._default
+
+    # predefined styles for luigi log messages
+    sched_action_colors = {
+        "PENDING": {"color": "cyan"},
+        "DONE": {"color": "green"},
+        "FAILED": {"color": "red"},
+    }
+    sched_task_style = {"style": "bright"}
+    sched_done_style = {"color": "green", "style": "bright"}
+    worker_action_colors = {
+        "running": {"color": "cyan"},
+        "done": {"color": "green"},
+        "failed": {"color": "red"},
+        "new requirements": {"color": "magenta"},
+    }
+    worker_task_style = sched_task_style
+
+    # precompiled expressions
+    cre_sched_action = r"^(Informed scheduler that task\s+)([^\s]+)(\s+has\sstatus\s+)({})(.*)$"
+    cre_sched_action = re.compile(cre_sched_action.format("|".join(sched_action_colors.keys())))
+    cre_sched_done = re.compile("^(Done scheduling tasks)$")
+    cre_worker_action = r"^(\[pid \d+\] Worker Worker\(.+\)\s+)({})(\s+)([^\(]+)(\(.+)$"
+    cre_worker_action = re.compile(cre_worker_action.format("|".join(worker_action_colors.keys())))
+
+    # log message formatter to partially colorize some luigi logs
+    def colorize_luigi_logs(record):
+        msg = record.getMessage()
+
+        # worker task messages
+        m = cre_worker_action.match(msg)
+        if m:
+            s1, action, s2, task, s3 = m.groups()
+            task = law.util.colored(task, **worker_task_style)
+            action = law.util.colored(action, **worker_action_colors[action])
+            return s1 + action + s2 + task + s3
+
+        # scheduler task registration messages
+        m = cre_sched_action.match(msg)
+        if m:
+            s1, task, s2, action, s3 = m.groups()
+            task = law.util.colored(task, **sched_task_style)
+            action = law.util.colored(action, **sched_action_colors[action])
+            return s1 + task + s2 + action + s3
+
+        # scheduler done building tree
+        m = cre_sched_done.match(msg)
+        if m:
+            msg = law.util.colored(m.group(1), **sched_done_style)
+            return msg
+
+        return msg
 
     @functools.wraps(_default_orig)
     def _default(cls, opts):
@@ -297,6 +350,11 @@ def patch_interface_logging():
         if tty_handlers_before:
             for handler in tty_handlers_after[len(tty_handlers_before):]:
                 _logger.removeHandler(handler)
+
+        # update formatters to colorize messages
+        for handler in _logger.handlers:
+            if isinstance(handler.formatter, law.logger.LogFormatter):
+                handler.formatter.format_msg = colorize_luigi_logs
 
         return ret
 

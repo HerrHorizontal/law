@@ -4,11 +4,10 @@
 Custom luigi parameters.
 """
 
-
 __all__ = [
     "NO_STR", "NO_INT", "NO_FLOAT", "is_no_param", "get_param", "TaskInstanceParameter",
-    "DurationParameter", "CSVParameter", "MultiCSVParameter", "NotifyParameter",
-    "NotifyMultiParameter", "NotifyMailParameter",
+    "DurationParameter", "CSVParameter", "MultiCSVParameter", "RangeParameter",
+    "MultiRangeParameter", "NotifyParameter", "NotifyMultiParameter", "NotifyMailParameter",
 ]
 
 
@@ -18,7 +17,7 @@ import six
 from law.notification import notify_mail
 from law.util import (
     human_duration, parse_duration, time_units, time_unit_aliases, is_lazy_iterable, make_tuple,
-    make_unique, brace_expand,
+    make_unique, brace_expand, is_nested,
 )
 
 
@@ -120,31 +119,33 @@ class DurationParameter(luigi.Parameter):
 
     def parse(self, inp):
         """"""
-        if not inp:
-            return 0.
-        else:
-            return parse_duration(inp, input_unit=self.unit, unit=self.unit)
+        if not inp or inp == NO_STR:
+            inp = "0"
+
+        return parse_duration(inp, input_unit=self.unit, unit=self.unit)
 
     def serialize(self, value):
         """"""
         if not value:
-            return "0"
-        else:
-            value_seconds = parse_duration(value, input_unit=self.unit, unit="s")
-            return human_duration(seconds=value_seconds, colon_format=True)
+            value = 0
+
+        value_seconds = parse_duration(value, input_unit=self.unit, unit="s")
+        return human_duration(seconds=value_seconds, colon_format=True)
 
 
 class CSVParameter(luigi.Parameter):
-    """ __init__(*args, cls=luigi.Parameter, unique=False, min_len=None, max_len=None, \
-        brace_expand=False, x=y, **kwargs)
+    """ __init__(*args, cls=luigi.Parameter, unique=False, sort=False, min_len=None, max_len=None, \
+        choices=None, brace_expand=False, **kwargs)
     Parameter that parses a comma-separated value (CSV) and produces a tuple. *cls* can refer to an
     other parameter class that will be used to parse and serialize the particular items.
 
     When *unique* is *True*, both parsing and serialization methods make sure that values are
-    unique.
+    unique. *sort* can be a boolean or a function for sorting parameter values.
 
     When *min_len* (*max_len*) is set to an integer, an error is raised in case the number of
-    elements to serialize or parse is deceeds (exceeds) that value.
+    elements to serialize or parse (evaluated after potentially ensuring uniqueness) deceeds
+    (exceeds) that value. Just like done in luigi's *ChoiceParamater*, *choices* can be a sequence
+    of accepted values.
 
     When *brace_expand* is *True*, brace expansion is applied, potentially extending the list of
     values.
@@ -167,6 +168,10 @@ class CSVParameter(luigi.Parameter):
         p.parse("4,5,6")
         # => ValueError
 
+        p = CSVParameter(cls=luigi.IntParameter, choices=(1, 2))
+        p.parse("2,3")
+        # => ValueError
+
         p = CSVParameter(cls=luigi.IntParameter, brace_expand=True)
         p.parse("1{2,3,4}9")
         # => (129, 139, 149)
@@ -183,7 +188,7 @@ class CSVParameter(luigi.Parameter):
        type: string
 
         Character used as a separator between CSV elements when parsing strings and serializing
-        values.
+        values. Defaults to ``","``.
 
     .. py:attribute:: _inst
        type: cls
@@ -197,8 +202,10 @@ class CSVParameter(luigi.Parameter):
     def __init__(self, *args, **kwargs):
         self._cls = kwargs.pop("cls", luigi.Parameter)
         self._unique = kwargs.pop("unique", False)
+        self._sort = kwargs.pop("sort", False)
         self._min_len = kwargs.pop("min_len", None)
         self._max_len = kwargs.pop("max_len", None)
+        self._choices = kwargs.pop("choices", None)
         self._brace_expand = kwargs.pop("brace_expand", False)
 
         # ensure that the default value is a tuple
@@ -208,6 +215,21 @@ class CSVParameter(luigi.Parameter):
         super(CSVParameter, self).__init__(*args, **kwargs)
 
         self._inst = self._cls()
+
+    def _check_unique(self, value):
+        if not self._unique:
+            return value
+
+        return make_unique(value)
+
+    def _check_sort(self, value):
+        if not self._sort:
+            return value
+
+        key = self._sort if callable(self._sort) else None
+        value = sorted(value, key=key)
+
+        return tuple(value)
 
     def _check_len(self, value):
         str_repr = lambda: self.CSV_SEP.join(str(v) for v in value)
@@ -221,58 +243,69 @@ class CSVParameter(luigi.Parameter):
             raise ValueError("'{}' contains {} value(s), a maximum of {} is required".format(
                 str_repr(), len(value), self._max_len))
 
+    def _check_choices(self, value):
+        if not self._choices:
+            return
+
+        unknown = []
+        for v in value:
+            if v not in self._choices:
+                unknown.append(v)
+
+        if unknown:
+            str_repr = lambda value: ",".join(str(v) for v in value)
+            raise ValueError("invalid parameter value(s) '{}', valid choices are '{}'".format(
+                str_repr(make_unique(unknown)), str_repr(self._choices)))
+
     def parse(self, inp):
         """"""
-        if inp in (None, "", NO_STR):
-            ret = tuple()
+        if not inp or inp == NO_STR:
+            value = tuple()
         elif isinstance(inp, (tuple, list)) or is_lazy_iterable(inp):
-            ret = make_tuple(inp)
+            value = make_tuple(inp)
         elif isinstance(inp, six.string_types):
             if self._brace_expand:
                 elems = brace_expand(inp, split_csv=True)
             else:
                 elems = inp.split(self.CSV_SEP)
-            ret = tuple(map(self._inst.parse, elems))
+            value = tuple(map(self._inst.parse, elems))
         else:
-            ret = (ret,)
+            value = (inp,)
 
-        # ensure uniqueness
-        if self._unique:
-            ret = make_unique(ret)
+        # apply uniqueness, sort, length and choices checks
+        value = self._check_unique(value)
+        value = self._check_sort(value)
+        self._check_len(value)
+        self._check_choices(value)
 
-        # check min_len and max_len
-        self._check_len(ret)
-
-        return ret
+        return value
 
     def serialize(self, value):
         """"""
         if not value:
-            return ""
-        else:
-            # ensure uniqueness
-            if self._unique:
-                value = make_unique(value)
+            value = tuple()
 
-            # check min_len and max_len
-            self._check_len(value)
+        value = make_tuple(value)
 
-            return self.CSV_SEP.join(str(self._inst.serialize(elem)) for elem in value)
+        # apply uniqueness, sort, length and choices checks
+        value = self._check_unique(value)
+        value = self._check_sort(value)
+        self._check_len(value)
+        self._check_choices(value)
+
+        return self.CSV_SEP.join(str(self._inst.serialize(elem)) for elem in value)
 
 
 class MultiCSVParameter(CSVParameter):
-    """ __init__(*args, cls=luigi.Parameter, unique=False, min_len=None, max_len=None, \
-        brace_expand=False, **kwargs)
+    """ __init__(*args, cls=luigi.Parameter, unique=False, sort=False, min_len=None, max_len=None, \
+        choices=None, brace_expand=False, **kwargs)
     Parameter that parses several comma-separated values (CSV), separated by colons, and produces a
     nested tuple. *cls* can refer to an other parameter class that will be used to parse and
     serialize the particular items.
 
-    Except for the additional support for multuple CSV sequences, the implementation is based on
-    :py:class:`CSVParameter`, which also handles the features controlled by *unique*, *max_len* and
-    *min_len*.
-
-    When *brace_expand* is *True*, brace expansion is applied, potentially extending the lists of
-    values.
+    Except for the additional support for multiple CSV sequences, the parsing and serialization
+    implementation is based on :py:class:`CSVParameter`, which also handles the features controlled
+    by *unique*, *sort*, *max_len*, *min_len*, *choices* and *brace_expand* per sequence of values.
 
     Example:
 
@@ -292,6 +325,10 @@ class MultiCSVParameter(CSVParameter):
         p.parse("4,5:6,7,8")
         # => ValueError
 
+        p = MultiCSVParameter(cls=luigi.IntParameter, choices=(1, 2))
+        p.parse("1,2:2,3")
+        # => ValueError
+
         p = MultiCSVParameter(cls=luigi.IntParameter, brace_expand=True)
         p.parse("4,5:6,7,8{8,9}")
         # => ((4, 5), (6, 7, 88, 89))
@@ -308,7 +345,7 @@ class MultiCSVParameter(CSVParameter):
        type: string
 
         Character used as a separator between CSV sequences when parsing strings and serializing
-        values.
+        values. Defaults to ``":"``.
 
     .. py:attribute:: _inst
        type: cls
@@ -321,23 +358,204 @@ class MultiCSVParameter(CSVParameter):
 
     def parse(self, inp):
         """"""
-        if isinstance(inp, (tuple, list)) or is_lazy_iterable(inp):
-            ret = tuple(super(MultiCSVParameter, self).parse(v) for v in inp)
+        if not inp or inp == NO_STR:
+            value = tuple()
+        elif isinstance(inp, (tuple, list)) or is_lazy_iterable(inp):
+            value = tuple(super(MultiCSVParameter, self).parse(v) for v in inp)
         elif isinstance(inp, six.string_types):
             elems = inp.split(self.MULTI_CSV_SEP)
-            ret = tuple(map(super(MultiCSVParameter, self).parse, elems))
+            value = tuple(super(MultiCSVParameter, self).parse(e) for e in elems)
         else:
-            ret = (super(MultiCSVParameter, self).parse(inp),)
+            value = (super(MultiCSVParameter, self).parse(inp),)
 
-        return ret
+        return value
 
     def serialize(self, value):
         """"""
         if not value:
             return ""
+
+        if not is_nested(value):
+            value = (value,)
+        return self.MULTI_CSV_SEP.join(
+            super(MultiCSVParameter, self).serialize(v) for v in value)
+
+
+class RangeParameter(luigi.Parameter):
+    """ __init__(*args, require_start=True, require_end=True, single_value=False, **kwargs)
+    Parameter that parse a range in the format ``start:stop`` and returns a tuple with two integer
+    elements.
+
+    When *require_start* or *require_stop* are *False*, the formats ``:stop`` and ``start:``,
+    respectively, are accepted as well. In these cases, the tuple will contain an attribute
+    :py:attr:`OPEN` do denote that either side is unconstrained.
+
+    When *single_value* is *True*, single integer values are accepted and lead to a tuple with one
+    element.
+
+    .. code-block:: python
+
+        p = RangeParameter()
+        p.parse("4:8")
+        # => (4, 8)
+        p.serialize((5, 9))
+        # => "5:9"
+        p.parse("4:")
+        # => ValueError
+        p.parse("4")
+        # => ValueError
+
+        p = RangeParameter(require_start=False, require_stop=False)
+        p.parse("4:5")
+        # => (4, 5)
+        p.parse("4:")
+        # => (4, OPEN)
+        p.parse(":5")
+        # => (OPEN, 5)
+        p.parse(":")
+        # => (OPEN, OPEN)
+        p.serialize((OPEN, 8))
+        # => ":8"
+
+        p = RangeParameter(single_value=True)
+        p.parse("4")
+        # => (4,)
+        p.serialize((5,))
+        # => "4"
+
+    .. py:classattribute:: RANGE_SEP
+       type: string
+
+        Character used as a separator between range edges when parsing strings and serializing
+        values. Defaults to ``":"``.
+
+    .. py:classattribute:: OPEN
+       type: None
+
+        Value denoting open edges in parsed ranges.
+    """
+
+    RANGE_SEP = ":"
+    OPEN = None
+
+    def __init__(self, *args, **kwargs):
+        self._require_start = kwargs.pop("require_start", True)
+        self._require_end = kwargs.pop("require_end", True)
+        self._single_value = kwargs.pop("single_value", False)
+
+        # ensure that the default value is a tuple
+        if "default" in kwargs:
+            kwargs["default"] = make_tuple(kwargs["default"])
+
+        super(RangeParameter, self).__init__(*args, **kwargs)
+
+    def _check(self, value):
+        if not isinstance(value, (tuple, list)):
+            raise TypeError("invalid type of range '{}'".format(value))
+
+        elif len(value) == 1 and self._single_value:
+            v = value[0]
+            if not isinstance(v, six.integer_types):
+                raise TypeError("invalid type of single value in range {}".format(value))
+
+        elif len(value) == 2:
+            start, end = value
+            if start == self.OPEN:
+                if self._require_start:
+                    raise ValueError("range {} lacks start value which is required".format(value))
+            elif not isinstance(start, six.integer_types):
+                raise TypeError("invalid type of start value in range {}".format(value))
+            if end == self.OPEN:
+                if self._require_end:
+                    raise ValueError("range {} lacks end value which is required".format(value))
+            elif not isinstance(end, six.integer_types):
+                raise TypeError("invalid type of end value in range {}".format(value))
+
+        elif value:
+            raise ValueError("cannot interpret {} with {} elements as {}".format(
+                value, len(value), self.__class__.__name__))
+
+    def parse(self, inp):
+        """"""
+        if not inp or inp == NO_STR:
+            value = tuple()
+        elif isinstance(inp, (tuple, list)) or is_lazy_iterable(inp):
+            value = make_tuple(inp)
+        elif isinstance(inp, six.string_types):
+            parts = inp.split(self.RANGE_SEP)
+            # convert integers
+            try:
+                value = tuple((int(p) if p else self.OPEN) for p in parts)
+            except ValueError:
+                raise ValueError("range {} contains non-integer elements".format(tuple(parts)))
         else:
-            return self.MULTI_CSV_SEP.join(
-                super(MultiCSVParameter, self).serialize(v) for v in value)
+            raise TypeError("cannot parse '{}' as {}".format(inp, self.__class__.__name__))
+
+        self._check(value)
+
+        return value
+
+    def serialize(self, value):
+        """"""
+        if not value:
+            value = tuple()
+
+        self._check(value)
+
+        value = [("" if v == self.OPEN else str(v)) for v in value]
+        return self.RANGE_SEP.join(value)
+
+
+class MultiRangeParameter(RangeParameter):
+    """ __init__(*args, require_start=True, require_end=True, single_value=False, **kwargs)
+    Parameter that parses several integer ranges (each in the format ``start-end``), separated by
+    comma, and produces a nested tuple.
+
+    Except for the additional support for multiple ranges, the parsing and serialization
+    implementation is based on :py:class:`RangeParameter`, which also handles the control of open
+    edges with *require_start* and *require_end*, and the acceptance of single integer values with
+    *single_value*. Example:
+
+    .. code-block:: python
+
+        p = MultiRangeParameter()
+        p.parse("4:8,12:14")
+        # => ((4, 8), (12, 14))
+        p.serialize(((5, 9), (13, 15)))
+        # => ""5:9,13:15""
+
+    .. py:classattribute:: MULTI_RANGE_SEP
+       type: string
+
+        Character used as a separator between ranges when parsing strings and serializing
+        values. Defaults to ``","``.
+    """
+
+    MULTI_RANGE_SEP = ","
+
+    def parse(self, inp):
+        """"""
+        if not inp or inp == NO_STR:
+            value = tuple()
+        elif isinstance(inp, (tuple, list)) or is_lazy_iterable(inp):
+            value = tuple(super(MultiRangeParameter, self).parse(v) for v in inp)
+        elif isinstance(inp, six.string_types):
+            elems = inp.split(self.MULTI_RANGE_SEP)
+            value = tuple(super(MultiRangeParameter, self).parse(e) for e in elems)
+        else:
+            value = (super(MultiRangeParameter, self).parse(inp),)
+
+        return value
+
+    def serialize(self, value):
+        """"""
+        if not value:
+            return ""
+
+        if not is_nested(value):
+            value = (value,)
+        return self.MULTI_RANGE_SEP.join(
+            super(MultiRangeParameter, self).serialize(v) for v in value)
 
 
 class NotifyParameter(luigi.BoolParameter):
@@ -418,4 +636,5 @@ class NotifyMailParameter(NotifyParameter):
         return {
             "func": self.notify,
             "raw": False,
+            "colored": False,
         }

@@ -4,7 +4,6 @@
 Functions that are invoked by interactive task methods.
 """
 
-
 __all__ = [
     "print_task_deps", "print_task_status", "print_task_output", "remove_task_output",
     "fetch_task_output",
@@ -17,7 +16,8 @@ import logging
 import six
 
 from law.target.base import Target
-from law.target.collection import TargetCollection
+from law.target.file import FileSystemTarget
+from law.target.collection import TargetCollection, FileCollection
 from law.util import (
     colored, flatten, flag_to_bool, query_choice, human_bytes, is_lazy_iterable, make_list,
 )
@@ -32,7 +32,7 @@ ind = "  "
 
 # helper to create a list of 3-tuples (target, depth, prefix) of an arbitrarily structured output
 def _flatten_output(output, depth):
-    if isinstance(output, (list, tuple)) or is_lazy_iterable(output):
+    if isinstance(output, (list, tuple, set)) or is_lazy_iterable(output):
         return [(outp, depth, "{}: ".format(i)) for i, outp in enumerate(output)]
     elif isinstance(output, dict):
         return [(outp, depth, "{}: ".format(k)) for k, outp in six.iteritems(output)]
@@ -50,11 +50,16 @@ def _iter_output(output, offset):
             yield output, odepth, oprefix, ooffset, lookup
 
         else:
-            # print the key of the current structure
-            print("{} {}".format(ooffset, oprefix))
+            # before updating the lookup list, but check if the output changes by this
+            _lookup = _flatten_output(output, odepth + 1)
+            if len(_lookup) > 0 and _lookup[0][0] == output:
+                print("{} {}{}".format(ooffset, oprefix, colored("not a target", color="red")))
+            else:
+                # print the key of the current structure
+                print("{} {}".format(ooffset, oprefix))
 
-            # update the lookup list
-            lookup[:0] = _flatten_output(output, odepth + 1)
+                # update the lookup list
+                lookup[:0] = _lookup
 
 
 def print_task_deps(task, max_depth=1):
@@ -110,8 +115,9 @@ def print_task_status(task, max_depth=0, target_depth=0, flags=None):
             print("{}{} {}".format(ooffset, ind, status_text))
 
 
-def print_task_output(task, max_depth=0):
+def print_task_output(task, max_depth=0, scheme=False):
     max_depth = int(max_depth)
+    scheme = flag_to_bool(scheme)
 
     print("print task output with max_depth {}\n".format(max_depth))
 
@@ -120,11 +126,14 @@ def print_task_output(task, max_depth=0):
         done.append(dep)
 
         for outp in flatten(dep.output()):
-            for uri in make_list(outp.uri()):
+            kwargs = {}
+            if isinstance(outp, (FileSystemTarget, FileCollection)):
+                kwargs = {"scheme": scheme}
+            for uri in make_list(outp.uri(**kwargs)):
                 print(uri)
 
 
-def remove_task_output(task, max_depth=0, mode=None, include_external=False):
+def remove_task_output(task, max_depth=0, mode=None, run_task=False):
     from law.task.base import ExternalTask
     from law.workflow.base import BaseWorkflow
 
@@ -132,9 +141,9 @@ def remove_task_output(task, max_depth=0, mode=None, include_external=False):
 
     print("remove task output with max_depth {}".format(max_depth))
 
-    include_external = flag_to_bool(include_external)
-    if include_external:
-        print("include external tasks")
+    run_task = flag_to_bool(run_task)
+    if run_task:
+        print("task will run after output removal")
 
     # determine the mode, i.e., interactive, dry, all
     modes = ["i", "d", "a"]
@@ -158,30 +167,45 @@ def remove_task_output(task, max_depth=0, mode=None, include_external=False):
         print("{}> {}".format(offset, dep.repr(color=True)))
         offset += "|" + ind
 
-        if not include_external and isinstance(dep, ExternalTask):
+        # always skip external tasks
+        if isinstance(dep, ExternalTask):
             print(offset + colored(" task is external", "yellow"))
             continue
 
+        # skip when this task was already handled
         if dep in done:
-            print(offset + colored(" already removed", "yellow"))
+            print(offset + colored(" already handled", "yellow"))
+            continue
+        done.append(dep)
+
+        # skip when mode is "all" and task is configured to skip
+        if mode == "a" and getattr(dep, "skip_output_removal", False):
+            print(offset + colored(" configured to skip", "yellow"))
             continue
 
+        # query for a decision per task when mode is "interactive"
+        task_mode = None
         if mode == "i":
             task_mode = query_choice(offset + " remove outputs?", ["y", "n", "a"], default="y",
                 descriptions=["yes", "no", "all"])
             if task_mode == "n":
                 continue
 
-        done.append(dep)
-
         # start the traversing through output structure
         for output, odepth, oprefix, ooffset, lookup in _iter_output(dep.output(), offset):
             print("{} {}{}".format(ooffset, oprefix, output.repr(color=True)))
 
+            # skip external targets
+            if getattr(output, "external", False):
+                print(ooffset + ind + colored(" external output", "yellow"))
+                continue
+
+            # stop here when in dry mode
             if mode == "d":
                 print(ooffset + ind + colored(" dry removed", "yellow"))
                 continue
 
+            # when the mode is "interactive" and the task decision is not "all", query per output
             if mode == "i" and task_mode != "a":
                 if isinstance(output, TargetCollection):
                     coll_choice = query_choice(ooffset + ind + " remove?", ("y", "n", "i"),
@@ -198,8 +222,11 @@ def remove_task_output(task, max_depth=0, mode=None, include_external=False):
                     print(ooffset + ind + colored(" skipped", "yellow"))
                     continue
 
+            # finally remove
             output.remove()
             print(ooffset + ind + colored(" removed", "red", style="bright"))
+
+    return run_task
 
 
 def fetch_task_output(task, max_depth=0, mode=None, target_dir=".", include_external=False):
@@ -268,26 +295,35 @@ def fetch_task_output(task, max_depth=0, mode=None, target_dir=".", include_exte
             except:
                 stat = None
 
+            # print the target repr
             target_line = "{} {}{}".format(ooffset, oprefix, output.repr(color=True))
             if stat:
                 target_line += " ({:.2f} {})".format(*human_bytes(stat.st_size))
             print(target_line)
 
+            # skip external targets
+            if not include_external and getattr(output, "external", False):
+                print(ooffset + ind + colored(" external output, skip", "yellow"))
+                continue
+
+            # skip missing targets
             if not isinstance(output, TargetCollection) and stat is None:
                 print(ooffset + ind + colored(" not existing, skip", "yellow"))
                 continue
 
+            # skip targets without a copy_to_local method
             is_copyable = callable(getattr(output, "copy_to_local", None))
             if not isinstance(output, TargetCollection) and not is_copyable:
                 print(ooffset + ind + colored(" not a file target, skip", "yellow"))
                 continue
 
+            # stop here when in dry mode
             if mode == "d":
                 print(ooffset + ind + colored(" dry fetched", "yellow"))
                 continue
 
+            # collect actual outputs to fetch
             to_fetch = [output]
-
             if mode == "i" and task_mode != "a":
                 if isinstance(output, TargetCollection):
                     coll_choice = query_choice(ooffset + ind + "fetch?", ("y", "n", "i"),
@@ -305,6 +341,7 @@ def fetch_task_output(task, max_depth=0, mode=None, target_dir=".", include_exte
                     print(ooffset + ind + colored(" skipped", "yellow"))
                     continue
 
+            # actual copy
             for outp in to_fetch:
                 if not callable(getattr(outp, "copy_to_local", None)):
                     continue
