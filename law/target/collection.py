@@ -19,7 +19,7 @@ import six
 from law.target.base import Target
 from law.target.file import FileSystemTarget, FileSystemDirectoryTarget, localize_file_targets
 from law.target.local import LocalDirectoryTarget
-from law.util import colored, flatten, create_hash
+from law.util import colored, flatten
 
 
 logger = logging.getLogger(__name__)
@@ -100,11 +100,6 @@ class TargetCollection(Target):
 
     def uri(self, *args, **kwargs):
         return flatten(t.uri(*args, **kwargs) for t in self._flat_target_list)
-
-    @property
-    def hash(self):
-        target_hashes = "".join(t.hash for t in self._flat_target_list)
-        return create_hash(self.__class__.__name__ + target_hashes)
 
     @property
     def first_target(self):
@@ -374,9 +369,10 @@ class NestedSiblingFileCollection(FileCollection):
     benefit over the standard :py:class:`FileCollection` (see description above). This is especially
     useful for large collections of remote files that are located in different (sub) directories.
 
-    The constructor identifies targets located in the same directory (of the same file system),
+    The constructor identifies targets located in the same physical directory (identified by URI),
     creates one collection for each of them, and stores them in the *collections* attribute. Key
-    access, iteration, etc., is identical to the standard :py:class:`FileCollection`.
+    access, iteration, etc., is identical to the standard
+    :py:class:`FileCollection`.
     """
 
     def __init__(self, *args, **kwargs):
@@ -384,21 +380,19 @@ class NestedSiblingFileCollection(FileCollection):
 
         # as per FileCollection's init, targets are already stored in both the _flat_targets and
         # _flat_target_list attributes, but store them again in sibling file collections to speed up
-        # some methods by dividing them into targets with same file system and in same directories
+        # some methods by grouping them into targets in the same physical directory
         self.collections = []
         self._flat_target_collections = {}
         grouped_targets = {}
         for t in flatten_collections(self._flat_target_list):
-            grouped_targets.setdefault(t.fs, {}).setdefault(t.dirname, []).append(t)
-
-        for fs_targets in grouped_targets.values():
-            for dir_targets in fs_targets.values():
-                # create and store the collection
-                collection = SiblingFileCollection(dir_targets)
-                self.collections.append(collection)
-                # remember the collection per target
-                for t in dir_targets:
-                    self._flat_target_collections[t] = collection
+            grouped_targets.setdefault(t.parent.uri(), []).append(t)
+        for targets in grouped_targets.values():
+            # create and store the collection
+            collection = SiblingFileCollection(targets)
+            self.collections.append(collection)
+            # remember the collection per target
+            for t in targets:
+                self._flat_target_collections[t] = collection
 
     def _repr_pairs(self):
         return FileCollection._repr_pairs(self) + [("collections", len(self.collections))]
